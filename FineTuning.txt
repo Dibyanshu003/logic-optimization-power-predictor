@@ -1,0 +1,41 @@
+#!/bin/bash
+ABC_PATH="/home/deep/Desktop/abc/abc-master/abc"
+BENCH="sin_orig.bench"
+POOL_CSV="ft_pool.csv"
+OUT_CSV="ft_labels.csv"
+LOGDIR="abc_logs"
+
+declare -A OPS=(
+  [1]=refactor [2]=rewrite [3]=resub [4]=balance
+  [5]=rfz       [6]=rwz     [7]=rsz   [8]=resyn2
+  [9]=st       [10]=share  [11]=c2rs  [12]=strash
+  [13]=drwsat2
+)
+
+mkdir -p "$LOGDIR"
+echo "op0,op1,op2,op3,op4,op5,op6,op7,op8,op9,op10,op11,op12,op13,op14,op15,op16,op17,op18,op19,power" > "$OUT_CSV"
+
+idx=0
+while IFS=, read -r op0 op1 op2 op3 op4 op5 op6 op7 op8 op9 op10 op11 op12 op13 op14 op15 op16 op17 op18 op19; do
+  idx=$((idx+1))
+  SCRIPT="$LOGDIR/seq_${idx}.abc"
+  LOG="$LOGDIR/log_${idx}.txt"
+
+  {
+    echo "read_bench $BENCH"
+    echo "strash"
+    for op in $op0 $op1 $op2 $op3 $op4 $op5 $op6 $op7 $op8 $op9 $op10 $op11 $op12 $op13 $op14 $op15 $op16 $op17 $op18 $op19; do
+      echo "${OPS[$op]}"
+    done
+    echo "ps -p"
+    echo "quit"
+  } > "$SCRIPT"
+
+  "$ABC_PATH" -c "source $SCRIPT" > "$LOG"
+  POWER=$(grep -oP "power\s*=\s*\K\d+(\.\d+)?" "$LOG")
+
+  echo "$op0,$op1,$op2,$op3,$op4,$op5,$op6,$op7,$op8,$op9,$op10,$op11,$op12,$op13,$op14,$op15,$op16,$op17,$op18,$op19,$POWER" \
+    >> "$OUT_CSV"
+done < "$POOL_CSV"
+
+echo "Fine‑tune labels written to $OUT_CSV"

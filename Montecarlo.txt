@@ -1,0 +1,111 @@
+#!/bin/bash
+ 
+ABC_PATH="/home/deep/Desktop/abc/abc-master/abc"
+BENCH_FILE="aes_xcrypt_orig.bench"
+ 
+OPERATIONS=("refactor" "rewrite" "resub" "balance" "rfz" "rwz" "rsz","resync2","st","share","c2rs","drwsat2")
+ 
+declare -A OPERATIONS_MAP=(
+    ["strash"]=1
+    ["refactor"]=2
+    ["rewrite"]=3
+    ["resub"]=4
+    ["balance"]=5
+    ["rfz"]=6
+    ["rwz"]=7
+    ["rsz"]=8
+    ["resyn2"]=9
+    ["st"]=10
+    ["share"]=11
+    ["c2rs"]=12
+    ["drwsat2"]=13
+)
+ 
+NUM_OPERATIONS=${#OPERATIONS[@]}
+SEQUENCE_LENGTH=20
+TOTAL_SEQUENCES=1000
+RESULTS_FILE="results_mc_q1.csv"
+LOG_DIR="abc_logs"
+BEST_SEQUENCES_FILE="best_sequences.txt"  # Store top-performing sequences
+ 
+mkdir -p "$LOG_DIR"
+ 
+# Write CSV header
+echo "Sequence,AND_Count,Level,Power,ANDxLevel" > "$RESULTS_FILE"
+ 
+declare -A BEST_SEQUENCES  # Stores best sequences with lowest power
+ 
+# Function to generate a sequence (biased sampling)
+generate_sequence() {
+    local sequence=("strash")
+ 
+    if [[ ${#BEST_SEQUENCES[@]} -gt 0 && $((RANDOM % 100)) -lt 70 ]]; then
+        # 70% chance: Modify a top-performing sequence
+        local best_seq=$(shuf -n 1 "$BEST_SEQUENCES_FILE")
+        sequence=($best_seq)
+        local mutate_index=$((RANDOM % SEQUENCE_LENGTH))
+        sequence[$mutate_index]=${OPERATIONS[RANDOM % NUM_OPERATIONS]}
+    else
+        # 30% chance: Generate a new random sequence
+        for ((i = 1; i < SEQUENCE_LENGTH; i++)); do
+            sequence+=("${OPERATIONS[RANDOM % NUM_OPERATIONS]}")
+        done
+    fi
+ 
+    echo "${sequence[@]}"
+}
+ 
+# Function to extract AND count, Level, Power
+extract_metrics() {
+    local output="$1"
+    local and_count=$(echo "$output" | grep -oP "and\s*=\s*\K\d+")
+    local level=$(echo "$output" | grep -oP "lev\s*=\s*\K\d+")
+    local power=$(echo "$output" | grep -oP "power\s*=\s*\K\d+(\.\d+)?")
+ 
+    [[ -z "$and_count" ]] && and_count="N/A"
+    [[ -z "$level" ]] && level="N/A"
+    [[ -z "$power" ]] && power="N/A"
+ 
+    if [[ "$and_count" != "N/A" && "$level" != "N/A" ]]; then
+        and_x_level=$((and_count * level))
+    else
+        and_x_level="N/A"
+    fi
+ 
+    echo "$and_count,$level,$power,$and_x_level"
+}
+ 
+# Run multiple sequences
+for ((seq_id = 1; seq_id <= TOTAL_SEQUENCES; seq_id++)); do
+    SEQUENCE=$(generate_sequence)
+    SEQ_FILE="sequence_${seq_id}.abc"
+    LOG_FILE="${LOG_DIR}/log_${seq_id}.txt"
+ 
+    echo "read_bench $BENCH_FILE" > "$SEQ_FILE"
+    for op in $SEQUENCE; do
+        echo "$op" >> "$SEQ_FILE"
+    done
+    echo "ps -p" >> "$SEQ_FILE"
+    echo "quit" >> "$SEQ_FILE"
+ 
+    "$ABC_PATH" -c "source $SEQ_FILE" > "$LOG_FILE"
+ 
+    METRICS=$(extract_metrics "$(cat "$LOG_FILE")")
+    POWER=$(echo "$METRICS" | cut -d ',' -f3)
+ 
+    OPERATION_IDS=()
+    for op in $SEQUENCE; do
+        OPERATION_IDS+=("${OPERATIONS_MAP[$op]}")
+    done
+    OPERATION_IDS_STR=$(echo "${OPERATION_IDS[@]}" | tr ' ' ',')
+ 
+    echo "$OPERATION_IDS_STR,$METRICS" >> "$RESULTS_FILE"
+    # Store best sequences (if power is the lowest so far)
+    if [[ "$POWER" != "N/A" ]]; then
+        echo "${SEQUENCE[*]}" >> "$BEST_SEQUENCES_FILE"
+    fi
+ 
+    echo "Completed sequence $seq_id (Power: $POWER)"
+done
+ 
+echo "Monte Carlo Sampling Completed! Results stored in $RESULTS_FILE"

@@ -1,0 +1,935 @@
++*In[1]:*+
+[source, ipython3]
+----
+
+# 1) IMPORTS
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
+import networkx as nx
+from torch_geometric.data import Data, Batch
+from torch_geometric.utils import from_networkx
+from torch_geometric.nn import GCNConv, global_mean_pool
+from sklearn.model_selection import train_test_split
+
+
+2) BENCH PARSER → NETWORKX → PyG
+def parse_bench_to_networkx(filepath):
+    G = nx.DiGraph()
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("INPUT("):
+                name = line[6:-1]
+                G.add_node(name, type="INPUT")
+            elif line.startswith("OUTPUT("):
+                name = line[7:-1]
+                G.add_node(name, type="OUTPUT")
+            elif "=" in line:
+                left, expr = line.split("=", 1)
+                left = left.strip()
+                gate_type = expr.split("(")[0].strip().upper()
+                inputs = expr[expr.find("(")+1:expr.rfind(")")].split(",")
+                inputs = [i.strip() for i in inputs]
+                G.add_node(left, type=gate_type)
+                for inp in inputs:
+                    G.add_edge(inp, left)
+    # map types to numeric feature
+    type_map = {
+        "INPUT": 0, "OUTPUT": 1, "AND": 2, "OR": 3,
+        "NAND": 4, "NOR": 5, "XOR": 6, "XNOR": 7,
+        "NOT": 8, "BUF": 9
+    }
+    for n in G.nodes:
+        t = G.nodes[n]['type']
+        G.nodes[n]['x'] = [type_map.get(t, 10)]
+    return G
+
+def load_graph(bench_path):
+    nxg = parse_bench_to_networkx(bench_path)
+    pyg = from_networkx(nxg)
+    pyg.x = torch.tensor([nxg.nodes[n]['x'] for n in nxg.nodes], dtype=torch.float)
+    return pyg
+
+# load all three designs
+graph1 = load_graph("sin_orig.bench")
+graph2 = load_graph("aes_xcrypt_orig.bench")
+graph3 = load_graph("sha256_orig.bench")
+
+
+# 3) LOAD CSVs → DATAFRAMES (20 op‑columns + last column = power)
+
+def load_recipe_df(csv_path):
+    df = pd.read_csv(csv_path, header=None)
+    cols = [f"op{i}" for i in range(20)] + ["Power"]
+    df.columns = cols
+    df["Recipe"] = df[[f"op{i}" for i in range(20)]].values.tolist()
+    df["Power"]  = df["Power"].astype(float)
+    return df
+
+df1 = load_recipe_df("sin.csv")   # 1000 samples for design1
+df2 = load_recipe_df("aes.csv")   # 1000 samples for design2
+df3 = load_recipe_df("sha.csv")   # 1000 samples for design3
+
+
+# 4) DATASET & CONCAT
+
+class RecipePowerDataset(Dataset):
+    def __init__(self, df, graph):
+        self.df    = df.reset_index(drop=True)
+        self.graph = graph
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        rec   = torch.tensor(self.df.loc[idx, "Recipe"], dtype=torch.long)
+        power = torch.tensor(self.df.loc[idx, "Power"],  dtype=torch.float)
+        return {"aig": self.graph, "recipe": rec, "power": power}
+
+ds1 = RecipePowerDataset(df1, graph1)
+ds2 = RecipePowerDataset(df2, graph2)
+ds3 = RecipePowerDataset(df3, graph3)
+
+full_ds = ConcatDataset([ds1, ds2, ds3])  # 3000 samples total
+
+def custom_collate(batch):
+    recipes = torch.stack([b["recipe"] for b in batch], dim=0)
+    powers  = torch.stack([b["power"]  for b in batch], dim=0)
+    graphs   = [b["aig"] for b in batch]
+    return {
+        "recipe": recipes,
+        "power":  powers,
+        "aig":    Batch.from_data_list(graphs)
+    }
+
+# 5) TRAIN/TEST SPLIT + DATALOADERS
+
+train_size = int(0.8 * len(full_ds))  # 2400
+test_size  = len(full_ds) - train_size  # 600
+train_ds, test_ds = random_split(full_ds, [train_size, test_size],
+                                 generator=torch.Generator().manual_seed(42))
+
+train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=custom_collate)
+test_loader  = DataLoader(test_ds,  batch_size=8, shuffle=False, collate_fn=custom_collate)
+
+
+# 6) MODEL DEFINITION: GCN + CNN Hybrid
+
+class PowerPredictorGCN_CNN(nn.Module):
+    def __init__(self, node_dim=1, num_ops=14, emb_dim=16, hid_dim=64):
+        super().__init__()
+        self.gcn1 = GCNConv(node_dim, hid_dim)
+        self.gcn2 = GCNConv(hid_dim, hid_dim)
+        self.embed  = nn.Embedding(num_ops, emb_dim)
+        self.conv1d = nn.Conv1d(emb_dim, 32, kernel_size=3, padding=1)
+        self.pool1d = nn.AdaptiveMaxPool1d(1)
+        self.fc1 = nn.Linear(hid_dim + 32, 64)
+        self.fc2 = nn.Linear(64, 1)
+
+    def forward(self, data):
+        x, edge, batch = data["aig"].x, data["aig"].edge_index, data["aig"].batch
+        x = F.relu(self.gcn1(x, edge))
+        x = F.relu(self.gcn2(x, edge))
+        x = global_mean_pool(x, batch)
+        r = data["recipe"]                       # [B,20]
+        e = self.embed(r).permute(0,2,1)         # [B,emb,20]
+        c = F.relu(self.conv1d(e))               # [B,32,20]
+        p = self.pool1d(c).squeeze(-1)           # [B,32]
+        h = torch.cat([x, p], dim=1)             # [B, hid+32]
+        h = F.relu(self.fc1(h))
+        return self.fc2(h).squeeze(1)            # [B]
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model  = PowerPredictorGCN_CNN().to(device)
+
+
+# 7) TRAINING + TESTING LOOP
+
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.MSELoss()
+epochs    = 80
+
+for ep in range(1, epochs+1):
+    # — Train —
+    model.train()
+    train_loss = 0.0
+    for batch in train_loader:
+        optimizer.zero_grad()
+        out  = model({"aig": batch["aig"].to(device),
+                      "recipe": batch["recipe"].to(device)})
+        loss = criterion(out, batch["power"].to(device))
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+    train_loss /= len(train_loader)
+
+    # — Test —
+    model.eval()
+    test_loss = 0.0
+    with torch.no_grad():
+        for batch in test_loader:
+            pred  = model({"aig": batch["aig"].to(device),
+                           "recipe": batch["recipe"].to(device)})
+            test_loss += criterion(pred, batch["power"].to(device)).item()
+    test_loss /= len(test_loader)
+
+    print(f"Epoch {ep:02d}/{epochs} → Train MSE: {train_loss:.2f} | Test MSE: {test_loss:.2f}")
+
+----
+
+
++*Out[1]:*+
+----
+Epoch 01/80 → Train MSE: 59106211.58 | Test MSE: 20576796.93
+Epoch 02/80 → Train MSE: 19938143.20 | Test MSE: 20170879.93
+Epoch 03/80 → Train MSE: 19518558.08 | Test MSE: 19736858.72
+Epoch 04/80 → Train MSE: 19057725.69 | Test MSE: 19291110.33
+Epoch 05/80 → Train MSE: 18609655.23 | Test MSE: 18885939.31
+Epoch 06/80 → Train MSE: 18199255.22 | Test MSE: 18508781.76
+Epoch 07/80 → Train MSE: 17810553.75 | Test MSE: 18167232.95
+Epoch 08/80 → Train MSE: 17395847.91 | Test MSE: 17866285.01
+Epoch 09/80 → Train MSE: 17057321.63 | Test MSE: 17632526.49
+Epoch 10/80 → Train MSE: 16783892.71 | Test MSE: 17348300.87
+Epoch 11/80 → Train MSE: 16543068.59 | Test MSE: 17150802.11
+Epoch 12/80 → Train MSE: 16335792.10 | Test MSE: 17000372.98
+Epoch 13/80 → Train MSE: 16130199.00 | Test MSE: 16915232.95
+Epoch 14/80 → Train MSE: 16058804.51 | Test MSE: 16772793.05
+Epoch 15/80 → Train MSE: 15907290.77 | Test MSE: 16692338.36
+Epoch 16/80 → Train MSE: 15804376.46 | Test MSE: 16626998.45
+Epoch 17/80 → Train MSE: 15699451.78 | Test MSE: 16533975.61
+Epoch 18/80 → Train MSE: 15583950.04 | Test MSE: 16471629.57
+Epoch 19/80 → Train MSE: 15411513.60 | Test MSE: 16189506.97
+Epoch 20/80 → Train MSE: 15073275.31 | Test MSE: 15750452.37
+Epoch 21/80 → Train MSE: 14456968.29 | Test MSE: 14742520.94
+Epoch 22/80 → Train MSE: 12671654.64 | Test MSE: 11754663.48
+Epoch 23/80 → Train MSE: 8384306.42 | Test MSE: 5954089.08
+Epoch 24/80 → Train MSE: 3390221.45 | Test MSE: 2081414.16
+Epoch 25/80 → Train MSE: 1734595.54 | Test MSE: 1628619.35
+Epoch 26/80 → Train MSE: 1564923.36 | Test MSE: 1537206.20
+Epoch 27/80 → Train MSE: 1529806.68 | Test MSE: 1574187.90
+Epoch 28/80 → Train MSE: 1511218.63 | Test MSE: 1484083.95
+Epoch 29/80 → Train MSE: 1506775.24 | Test MSE: 1615884.58
+Epoch 30/80 → Train MSE: 1450311.49 | Test MSE: 1448109.96
+Epoch 31/80 → Train MSE: 1428973.60 | Test MSE: 1419235.74
+Epoch 32/80 → Train MSE: 1403521.14 | Test MSE: 1410706.44
+Epoch 33/80 → Train MSE: 1363007.49 | Test MSE: 1369875.48
+Epoch 34/80 → Train MSE: 1335435.28 | Test MSE: 1407176.41
+Epoch 35/80 → Train MSE: 1318319.02 | Test MSE: 1315589.68
+Epoch 36/80 → Train MSE: 1292771.48 | Test MSE: 1335055.03
+Epoch 37/80 → Train MSE: 1263865.75 | Test MSE: 1278745.48
+Epoch 38/80 → Train MSE: 1238392.92 | Test MSE: 1252635.86
+Epoch 39/80 → Train MSE: 1196294.61 | Test MSE: 1234081.29
+Epoch 40/80 → Train MSE: 1162659.59 | Test MSE: 1192340.26
+Epoch 41/80 → Train MSE: 1147959.47 | Test MSE: 1174409.60
+Epoch 42/80 → Train MSE: 1113914.20 | Test MSE: 1129485.89
+Epoch 43/80 → Train MSE: 1072729.48 | Test MSE: 1106132.80
+Epoch 44/80 → Train MSE: 1043428.10 | Test MSE: 1156136.49
+Epoch 45/80 → Train MSE: 1010850.43 | Test MSE: 1042664.72
+Epoch 46/80 → Train MSE: 959860.72 | Test MSE: 1002293.71
+Epoch 47/80 → Train MSE: 933262.52 | Test MSE: 984017.69
+Epoch 48/80 → Train MSE: 903985.95 | Test MSE: 1022301.99
+Epoch 49/80 → Train MSE: 864820.22 | Test MSE: 908147.43
+Epoch 50/80 → Train MSE: 838963.36 | Test MSE: 875547.28
+Epoch 51/80 → Train MSE: 795913.35 | Test MSE: 851376.71
+Epoch 52/80 → Train MSE: 777671.07 | Test MSE: 819428.83
+Epoch 53/80 → Train MSE: 734819.24 | Test MSE: 923981.17
+Epoch 54/80 → Train MSE: 716495.75 | Test MSE: 770351.29
+Epoch 55/80 → Train MSE: 683047.60 | Test MSE: 727396.85
+Epoch 56/80 → Train MSE: 646294.09 | Test MSE: 699438.11
+Epoch 57/80 → Train MSE: 620895.44 | Test MSE: 685897.91
+Epoch 58/80 → Train MSE: 594549.46 | Test MSE: 655249.06
+Epoch 59/80 → Train MSE: 571081.11 | Test MSE: 677658.05
+Epoch 60/80 → Train MSE: 545207.32 | Test MSE: 616332.22
+Epoch 61/80 → Train MSE: 528155.12 | Test MSE: 586450.65
+Epoch 62/80 → Train MSE: 495708.86 | Test MSE: 569510.38
+Epoch 63/80 → Train MSE: 485680.52 | Test MSE: 681475.67
+Epoch 64/80 → Train MSE: 471751.81 | Test MSE: 562159.32
+Epoch 65/80 → Train MSE: 453900.37 | Test MSE: 522090.55
+Epoch 66/80 → Train MSE: 428284.05 | Test MSE: 514521.42
+Epoch 67/80 → Train MSE: 418144.93 | Test MSE: 497752.61
+Epoch 68/80 → Train MSE: 410669.22 | Test MSE: 472757.93
+Epoch 69/80 → Train MSE: 411311.79 | Test MSE: 476332.96
+Epoch 70/80 → Train MSE: 385348.10 | Test MSE: 447630.95
+Epoch 71/80 → Train MSE: 373488.66 | Test MSE: 437870.12
+Epoch 72/80 → Train MSE: 353826.91 | Test MSE: 478498.75
+Epoch 73/80 → Train MSE: 364312.16 | Test MSE: 428860.96
+Epoch 74/80 → Train MSE: 347619.82 | Test MSE: 443841.54
+Epoch 75/80 → Train MSE: 342022.78 | Test MSE: 432477.48
+Epoch 76/80 → Train MSE: 344597.02 | Test MSE: 405443.97
+Epoch 77/80 → Train MSE: 324759.56 | Test MSE: 398926.05
+Epoch 78/80 → Train MSE: 328657.15 | Test MSE: 395612.82
+Epoch 79/80 → Train MSE: 318945.59 | Test MSE: 391073.65
+Epoch 80/80 → Train MSE: 318529.54 | Test MSE: 384015.85
+----
+
+
++*In[2]:*+
+[source, ipython3]
+----
+# ─── Select 50 Recipes via K‑Means for FT+A ────────────────────────────────
+import numpy as np
+from sklearn.cluster import KMeans
+import pandas as pd
+
+model.eval()
+
+# 1) Batch‑extract all 3 000 recipe embeddings
+embs = []
+loader = DataLoader(full_ds, batch_size=128, shuffle=False, collate_fn=custom_collate)
+with torch.no_grad():
+    for batch in loader:
+        r = batch["recipe"].to(device)          # [B,20]
+        e = model.embed(r)                      # [B,20,emb]
+        e = e.permute(0,2,1)                    # [B,emb,20]
+        c = F.relu(model.conv1d(e))             # [B,32,20]
+        p = model.pool1d(c).squeeze(-1)         # [B,32]
+        embs.append(p.cpu().numpy())
+embs = np.vstack(embs)                        # shape (3000,32)
+
+# 2) K‑Means (K=50) on those embeddings
+km = KMeans(n_clusters=50, random_state=42).fit(embs)
+centroids, labels = km.cluster_centers_, km.labels_
+
+# 3) Pick the nearest recipe index per cluster
+chosen_idxs = []
+for cid in range(50):
+    members = np.where(labels == cid)[0]
+    dists   = np.linalg.norm(embs[members] - centroids[cid], axis=1)
+    chosen_idxs.append(int(members[np.argmin(dists)]))
+
+# 4) Reconstruct and dump those 50 op‑sequences
+all_recs = ds1.df["Recipe"].tolist() + ds2.df["Recipe"].tolist() + ds3.df["Recipe"].tolist()
+df50     = pd.DataFrame([all_recs[i] for i in chosen_idxs],
+                       columns=[f"op{i}" for i in range(20)])
+df50.to_csv("ft_pool1.csv", index=False, header=False)
+
+print("Wrote 50 representative recipes to ft_pool1.csv; ready for ABC labeling.")
+
+----
+
+
++*Out[2]:*+
+----
+Wrote 50 representative recipes to ft_pool1.csv; ready for ABC labeling.
+----
+
+
++*In[3]:*+
+[source, ipython3]
+----
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import networkx as nx
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.utils import from_networkx
+from torch_geometric.data import Batch
+
+# 1) PARSE iir_orig.bench INTO A PyG GRAPH ───────────────────────────────
+def parse_bench_to_networkx(filepath):
+    G = nx.DiGraph()
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith("INPUT("):
+                name = line[6:-1]; G.add_node(name, type="INPUT")
+            elif line.startswith("OUTPUT("):
+                name = line[7:-1]; G.add_node(name, type="OUTPUT")
+            elif "=" in line:
+                left, expr = line.split("=", 1)
+                left = left.strip()
+                gate = expr.split("(")[0].strip().upper()
+                ins  = expr[expr.find("(")+1:expr.rfind(")")].split(",")
+                ins  = [i.strip() for i in ins]
+                G.add_node(left, type=gate)
+                for inp in ins: G.add_edge(inp, left)
+    type_map = {
+        "INPUT":0, "OUTPUT":1, "AND":2, "OR":3,
+        "NAND":4,  "NOR":5,    "XOR":6, "XNOR":7,
+        "NOT":8,    "BUF":9
+    }
+    for n in G.nodes:
+        G.nodes[n]['x'] = [ type_map.get(G.nodes[n]['type'], 10) ]
+    return G
+
+# load & move to device
+bench3 = "iir_orig.bench"
+nxg3   = parse_bench_to_networkx(bench3)
+graph3 = from_networkx(nxg3)
+graph3.x = torch.tensor([nxg3.nodes[n]['x'] for n in nxg3.nodes], dtype=torch.float)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+graph3 = graph3.to(device)
+
+
+# 2) LOAD medium.csv (20 op‑cols + power header) ─────────────────────────
+df = pd.read_csv("medium.csv", header=0)   # uses first row as column names
+# ensure correct dtypes
+op_cols = [f"op{i}" for i in range(20)]
+df[op_cols]    = df[op_cols].astype(int)
+df["power"]    = df["power"].astype(float)
+# build the Recipe list for each row
+df["Recipe"]   = df[op_cols].values.tolist()
+
+
+#  3) WRAP INTO Dataset & DataLoader ─────────────────────────────────────
+class IIRDataset(Dataset):
+    def __init__(self, dataframe, graph):
+        self.df    = dataframe.reset_index(drop=True)
+        self.graph = graph
+    def __len__(self):
+        return len(self.df)
+    def __getitem__(self, idx):
+        return {
+            "aig":    self.graph,
+            "recipe": torch.tensor(self.df.loc[idx, "Recipe"], dtype=torch.long),
+            "power":  torch.tensor(self.df.loc[idx, "power"],  dtype=torch.float)
+        }
+
+def collate_fn(batch):
+    recs  = torch.stack([b["recipe"] for b in batch],   dim=0)
+    pwrs  = torch.stack([b["power"]  for b in batch],   dim=0)
+    graphs= [b["aig"] for b in batch]
+    return {
+        "recipe": recs,
+        "power":  pwrs,
+        "aig":    Batch.from_data_list(graphs)
+    }
+
+iir_ds     = IIRDataset(df, graph3)
+iir_loader = DataLoader(iir_ds, batch_size=4, shuffle=True, collate_fn=collate_fn)
+print(f"Loaded {len(iir_ds)} samples from medium.csv for fine‑tuning on {bench3}")
+
+
+# 4) FEW‑SHOT FINE‑TUNING ─────────────────────────────────────────────────
+model.to(device).train()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+criterion = nn.MSELoss()
+epochs_ft  = 15
+
+for ep in range(1, epochs_ft+1):
+    total_loss = 0.0
+    for batch in iir_loader:
+        optimizer.zero_grad()
+        out = model({
+            "aig":    batch["aig"].to(device),
+            "recipe": batch["recipe"].to(device)
+        })
+        loss = criterion(out, batch["power"].to(device))
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"FT Epoch {ep:02d}/{epochs_ft} → MSE: {total_loss/len(iir_loader):.4f}")
+
+#save the fine‑tuned weights
+torch.save(model.state_dict(), "power_predictor_iir_finetuned.pth")
+print("Fine‑tuning on Design 3 complete; model saved.")
+
+----
+
+
++*Out[3]:*+
+----
+Loaded 50 samples from medium.csv for fine‑tuning on iir_orig.bench
+FT Epoch 01/15 → MSE: 2237664.6827
+FT Epoch 02/15 → MSE: 1837000.2692
+FT Epoch 03/15 → MSE: 1429625.3077
+FT Epoch 04/15 → MSE: 1111123.7548
+FT Epoch 05/15 → MSE: 895020.7572
+FT Epoch 06/15 → MSE: 671803.5168
+FT Epoch 07/15 → MSE: 516550.0625
+FT Epoch 08/15 → MSE: 428698.6094
+FT Epoch 09/15 → MSE: 330778.3750
+FT Epoch 10/15 → MSE: 262010.6124
+FT Epoch 11/15 → MSE: 218924.5817
+FT Epoch 12/15 → MSE: 185548.0610
+FT Epoch 13/15 → MSE: 145804.5234
+FT Epoch 14/15 → MSE: 127887.2997
+FT Epoch 15/15 → MSE: 110457.0657
+Fine‑tuning on Design 3 complete; model saved.
+----
+
+
++*In[7]:*+
+[source, ipython3]
+----
+import torch
+from torch_geometric.data import Batch
+
+# 0) (Re‑)load your fine‑tuned weights, if you haven’t already:
+# model.load_state_dict(torch.load("power_predictor_iir_finetuned.pth"))
+# model.to(device)
+
+# 1) Define the recipe you want to predict (20 operation IDs)
+new_recipe = [1, 6, 5, 6, 10, 12, 5, 11, 9, 13, 3, 5, 5, 11, 9, 2, 2, 6, 13, 8]
+
+# 2) Make a batch of size 1 and send to the same device as your model
+recipe_tensor = torch.tensor([new_recipe], dtype=torch.long).to(device)  
+graph_batch   = Batch.from_data_list([graph3]).to(device)  
+
+# 3) Switch to eval mode and do a forward‑pass
+model.eval()
+with torch.no_grad():
+    pred_power = model({
+        "aig":    graph_batch,
+        "recipe": recipe_tensor
+    }).item()
+
+print(f"Predicted power: {pred_power:.2f}")
+
+----
+
+
++*Out[7]:*+
+----
+Predicted power: 4588.78
+----
+
+
++*In[11]:*+
+[source, ipython3]
+----
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import networkx as nx
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.utils import from_networkx
+from torch_geometric.data import Batch
+
+# ─── 1) PARSE aes_orig.bench INTO A PyG GRAPH ───────────────────────────────
+def parse_bench_to_networkx(filepath):
+    G = nx.DiGraph()
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith("INPUT("):
+                name = line[6:-1]; G.add_node(name, type="INPUT")
+            elif line.startswith("OUTPUT("):
+                name = line[7:-1]; G.add_node(name, type="OUTPUT")
+            elif "=" in line:
+                left, expr = line.split("=", 1)
+                left = left.strip()
+                gate = expr.split("(")[0].strip().upper()
+                ins  = expr[expr.find("(")+1:expr.rfind(")")].split(",")
+                ins  = [i.strip() for i in ins]
+                G.add_node(left, type=gate)
+                for inp in ins:
+                    G.add_edge(inp, left)
+    type_map = {
+        "INPUT":0, "OUTPUT":1, "AND":2, "OR":3,
+        "NAND":4,  "NOR":5,   "XOR":6, "XNOR":7,
+        "NOT":8,    "BUF":9
+    }
+    for n in G.nodes:
+        G.nodes[n]['x'] = [type_map.get(G.nodes[n]['type'], 10)]
+    return G
+
+bench_aes = "aes_orig.bench"
+nxg_aes   = parse_bench_to_networkx(bench_aes)
+graph_aes = from_networkx(nxg_aes)
+graph_aes.x = torch.tensor(
+    [nxg_aes.nodes[n]['x'] for n in nxg_aes.nodes],
+    dtype=torch.float
+)
+device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+graph_aes = graph_aes.to(device)
+
+# ─── 2) LOAD high.csv (20 op‑columns + power header) ─────────────────────────
+df = pd.read_csv("high.csv", header=0)
+op_cols = [f"op{i}" for i in range(20)]
+df[op_cols] = df[op_cols].astype(int)
+df["power"] = df["power"].astype(float)
+df["Recipe"] = df[op_cols].values.tolist()
+
+# ─── 3) WRAP INTO Dataset & DataLoader ─────────────────────────────────────
+class AESDataset(Dataset):
+    def __init__(self, dataframe, graph):
+        self.df    = dataframe.reset_index(drop=True)
+        self.graph = graph
+    def __len__(self):
+        return len(self.df)
+    def __getitem__(self, idx):
+        return {
+            "aig":    self.graph,
+            "recipe": torch.tensor(self.df.loc[idx, "Recipe"], dtype=torch.long),
+            "power":  torch.tensor(self.df.loc[idx, "power"],  dtype=torch.float)
+        }
+
+def collate_fn(batch):
+    recs  = torch.stack([b["recipe"] for b in batch], dim=0)
+    pwrs  = torch.stack([b["power"]  for b in batch], dim=0)
+    graphs= [b["aig"] for b in batch]
+    return {
+        "recipe": recs,
+        "power":  pwrs,
+        "aig":    Batch.from_data_list(graphs)
+    }
+
+aes_ds     = AESDataset(df, graph_aes)
+aes_loader = DataLoader(aes_ds, batch_size=4, shuffle=True, collate_fn=collate_fn)
+print(f"Loaded {len(aes_ds)} samples from high.csv for fine‑tuning on {bench_aes}")
+
+# ─── 4) FEW‑SHOT FINE‑TUNING ─────────────────────────────────────────────────
+model.to(device).train()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+criterion = nn.MSELoss()
+epochs_ft = 30
+
+for ep in range(1, epochs_ft+1):
+    total_loss = 0.0
+    for batch in aes_loader:
+        optimizer.zero_grad()
+        preds = model({
+            "aig":    batch["aig"].to(device),
+            "recipe": batch["recipe"].to(device)
+        })
+        loss = criterion(preds, batch["power"].to(device))
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    avg = total_loss / len(aes_loader)
+    print(f"AES FT Epoch {ep:02d}/{epochs_ft} → MSE: {avg:.4f}")
+
+# Optional: save the fine‑tuned AES model
+torch.save(model.state_dict(), "power_predictor_aes_finetuned.pth")
+print("✅ Fine‑tuning on AES complete; model saved as power_predictor_aes_finetuned.pth")
+
+----
+
+
++*Out[11]:*+
+----
+Loaded 50 samples from high.csv for fine‑tuning on aes_orig.bench
+AES FT Epoch 01/30 → MSE: 146850.4486
+AES FT Epoch 02/30 → MSE: 145880.8327
+AES FT Epoch 03/30 → MSE: 143263.4606
+AES FT Epoch 04/30 → MSE: 148202.9363
+AES FT Epoch 05/30 → MSE: 149351.8062
+AES FT Epoch 06/30 → MSE: 155122.4495
+AES FT Epoch 07/30 → MSE: 139748.1875
+AES FT Epoch 08/30 → MSE: 142040.7993
+AES FT Epoch 09/30 → MSE: 151554.6959
+AES FT Epoch 10/30 → MSE: 143879.5216
+AES FT Epoch 11/30 → MSE: 135228.9330
+AES FT Epoch 12/30 → MSE: 137390.5627
+AES FT Epoch 13/30 → MSE: 134466.0715
+AES FT Epoch 14/30 → MSE: 134489.4982
+AES FT Epoch 15/30 → MSE: 132163.6140
+AES FT Epoch 16/30 → MSE: 129777.9169
+AES FT Epoch 17/30 → MSE: 141006.0688
+AES FT Epoch 18/30 → MSE: 136605.7894
+AES FT Epoch 19/30 → MSE: 130642.0240
+AES FT Epoch 20/30 → MSE: 128395.8370
+AES FT Epoch 21/30 → MSE: 125932.3218
+AES FT Epoch 22/30 → MSE: 125710.9461
+AES FT Epoch 23/30 → MSE: 124051.6663
+AES FT Epoch 24/30 → MSE: 124138.2151
+AES FT Epoch 25/30 → MSE: 122457.5117
+AES FT Epoch 26/30 → MSE: 121821.3557
+AES FT Epoch 27/30 → MSE: 124748.0757
+AES FT Epoch 28/30 → MSE: 125179.5439
+AES FT Epoch 29/30 → MSE: 124927.2468
+AES FT Epoch 30/30 → MSE: 130501.8839
+✅ Fine‑tuning on AES complete; model saved as power_predictor_aes_finetuned.pth
+----
+
+
++*In[14]:*+
+[source, ipython3]
+----
+import torch
+from torch_geometric.data import Batch
+
+# 0) (Re‑)load your fine‑tuned weights, if you haven’t already:
+# model.load_state_dict(torch.load("power_predictor_iir_finetuned.pth"))
+# model.to(device)
+
+# 1) Define the recipe you want to predict (20 operation IDs)
+new_recipe = [1, 12, 12, 3, 2, 3, 10, 12, 2, 11, 3, 11, 13, 12, 2, 8, 4, 7, 9, 4]
+
+# 2) Make a batch of size 1 and send to the same device as your model
+recipe_tensor = torch.tensor([new_recipe], dtype=torch.long).to(device)  
+graph_batch   = Batch.from_data_list([graph_aes]).to(device)  
+
+# 3) Switch to eval mode and do a forward‑pass
+model.eval()
+with torch.no_grad():
+    pred_power = model({
+        "aig":    graph_batch,
+        "recipe": recipe_tensor
+    }).item()
+
+print(f"Predicted power: {pred_power:.2f}")
+
+----
+
+
++*Out[14]:*+
+----
+Predicted power: 9923.57
+----
+
+
++*In[15]:*+
+[source, ipython3]
+----
+# ─── Select 250 Recipes via K‑Means for FT+A ────────────────────────────────
+import numpy as np
+from sklearn.cluster import KMeans
+import pandas as pd
+import torch.nn.functional as F
+
+model.eval()
+
+# 1) Batch‑extract all 3 000 recipe embeddings
+embs = []
+loader = DataLoader(full_ds, batch_size=128, shuffle=False, collate_fn=custom_collate)
+with torch.no_grad():
+    for batch in loader:
+        r = batch["recipe"].to(device)            # [B,20]
+        e = model.embed(r)                        # [B,20,emb]
+        e = e.permute(0,2,1)                      # [B,emb,20]
+        c = F.relu(model.conv1d(e))               # [B,32,20]
+        p = model.pool1d(c).squeeze(-1)           # [B,32]
+        embs.append(p.cpu().numpy())
+embs = np.vstack(embs)                          # (3000,32)
+print("Built embedding matrix:", embs.shape)
+
+# 2) K‑Means (K=250) on those embeddings
+K = 250
+km = KMeans(n_clusters=K, random_state=42).fit(embs)
+centroids, labels = km.cluster_centers_, km.labels_
+
+# 3) Pick the nearest recipe index per cluster
+chosen_idxs = []
+for cid in range(K):
+    members = np.where(labels == cid)[0]
+    dists   = np.linalg.norm(embs[members] - centroids[cid], axis=1)
+    chosen_idxs.append(int(members[np.argmin(dists)]))
+print(f"Selected {len(chosen_idxs)} indices (0–2999)")
+
+# 4) Reconstruct and dump those 250 op‑sequences
+all_recs = ds1.df["Recipe"].tolist() + ds2.df["Recipe"].tolist() + ds3.df["Recipe"].tolist()
+df250    = pd.DataFrame(
+    [all_recs[i] for i in chosen_idxs],
+    columns=[f"op{i}" for i in range(20)]
+)
+df250.to_csv("ft_pool250.csv", index=False, header=False)
+print("✔︎ Wrote 250 representative recipes to ft_pool250.csv; ready for ABC labeling.")
+
+----
+
+
++*Out[15]:*+
+----
+Built embedding matrix: (3000, 32)
+Selected 250 indices (0–2999)
+✔︎ Wrote 250 representative recipes to ft_pool250.csv; ready for ABC labeling.
+----
+
+
++*In[18]:*+
+[source, ipython3]
+----
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import networkx as nx
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.utils import from_networkx
+from torch_geometric.data import Batch
+
+# ─── 1) PARSE max_orig.bench INTO A PyG GRAPH ───────────────────────────────
+def parse_bench_to_networkx(filepath):
+    G = nx.DiGraph()
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith("INPUT("):
+                n = line[6:-1]; G.add_node(n, type="INPUT")
+            elif line.startswith("OUTPUT("):
+                n = line[7:-1]; G.add_node(n, type="OUTPUT")
+            elif "=" in line:
+                left, expr = line.split("=", 1)
+                left = left.strip()
+                gate = expr.split("(")[0].strip().upper()
+                ins  = expr[expr.find("(")+1:expr.rfind(")")].split(",")
+                ins  = [i.strip() for i in ins]
+                G.add_node(left, type=gate)
+                for inp in ins:
+                    G.add_edge(inp, left)
+    type_map = {
+        "INPUT":0, "OUTPUT":1, "AND":2,   "OR":3,
+        "NAND":4,  "NOR":5,    "XOR":6,  "XNOR":7,
+        "NOT":8,    "BUF":9
+    }
+    for n in G.nodes:
+        G.nodes[n]['x'] = [ type_map.get(G.nodes[n]['type'], 10) ]
+    return G
+
+bench_file = "max_orig.bench"
+nxg_max    = parse_bench_to_networkx(bench_file)
+graph_max  = from_networkx(nxg_max)
+graph_max.x = torch.tensor(
+    [nxg_max.nodes[n]['x'] for n in nxg_max.nodes],
+    dtype=torch.float
+).to(device)
+
+# ─── 2) LOAD smallmodel.csv (20 op‑columns + 'power' header) ──────────────
+df_sm = pd.read_csv("smallmodel.csv", header=0)
+op_cols = [f"op{i}" for i in range(20)]
+# cast each op‐column to int, and power to float
+df_sm[op_cols] = df_sm[op_cols].astype(int)
+df_sm["power"] = df_sm["power"].astype(float)
+# assemble list of ops per row
+df_sm["Recipe"] = df_sm[op_cols].values.tolist()
+
+# ─── 3) WRAP INTO Dataset & DataLoader ─────────────────────────────────────
+class MaxDataset(Dataset):
+    def __init__(self, df, graph):
+        self.df    = df.reset_index(drop=True)
+        self.graph = graph
+    def __len__(self):
+        return len(self.df)
+    def __getitem__(self, idx):
+        return {
+            "aig":    self.graph,
+            "recipe": torch.tensor(self.df.loc[idx,"Recipe"], dtype=torch.long),
+            "power":  torch.tensor(self.df.loc[idx,"power"],  dtype=torch.float)
+        }
+
+def collate_fn(batch):
+    recs  = torch.stack([b["recipe"] for b in batch], dim=0)
+    pwrs  = torch.stack([b["power"]  for b in batch], dim=0)
+    gs    = [b["aig"] for b in batch]
+    return {
+        "recipe": recs,
+        "power":  pwrs,
+        "aig":    Batch.from_data_list(gs)
+    }
+
+max_ds     = MaxDataset(df_sm, graph_max)
+max_loader = DataLoader(max_ds, batch_size=4, shuffle=True, collate_fn=collate_fn)
+print(f"Loaded {len(max_ds)} samples from smallmodel.csv for fine‑tuning on {bench_file}")
+
+# ─── 4) FEW‑SHOT FINE‑TUNING ─────────────────────────────────────────────────
+model.to(device).train()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+criterion = nn.MSELoss()
+epochs_ft = 30
+
+for ep in range(1, epochs_ft+1):
+    total_loss = 0.0
+    for batch in max_loader:
+        optimizer.zero_grad()
+        preds = model({
+            "aig":    batch["aig"].to(device),
+            "recipe": batch["recipe"].to(device)
+        })
+        loss = criterion(preds, batch["power"].to(device))
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    avg_loss = total_loss / len(max_loader)
+    print(f"FT Epoch {ep:02d}/{epochs_ft} → MSE: {avg_loss:.4f}")
+
+# Optional: save the fine‑tuned max model
+torch.save(model.state_dict(), "power_predictor_max_finetuned.pth")
+print("✅ Fine‑tuning on max_orig.bench complete; model saved.")
+
+----
+
+
++*Out[18]:*+
+----
+Loaded 250 samples from smallmodel.csv for fine‑tuning on max_orig.bench
+FT Epoch 01/30 → MSE: 139709.1981
+FT Epoch 02/30 → MSE: 41046.1378
+FT Epoch 03/30 → MSE: 40003.8783
+FT Epoch 04/30 → MSE: 39369.7867
+FT Epoch 05/30 → MSE: 38238.6941
+FT Epoch 06/30 → MSE: 38040.7208
+FT Epoch 07/30 → MSE: 37105.9296
+FT Epoch 08/30 → MSE: 37404.3389
+FT Epoch 09/30 → MSE: 36987.1990
+FT Epoch 10/30 → MSE: 35901.4325
+FT Epoch 11/30 → MSE: 36429.9381
+FT Epoch 12/30 → MSE: 35425.1082
+FT Epoch 13/30 → MSE: 35301.6798
+FT Epoch 14/30 → MSE: 34113.4060
+FT Epoch 15/30 → MSE: 33473.7315
+FT Epoch 16/30 → MSE: 33054.5466
+FT Epoch 17/30 → MSE: 32352.9709
+FT Epoch 18/30 → MSE: 32152.7328
+FT Epoch 19/30 → MSE: 32494.8205
+FT Epoch 20/30 → MSE: 31350.7911
+FT Epoch 21/30 → MSE: 30898.7694
+FT Epoch 22/30 → MSE: 30665.6828
+FT Epoch 23/30 → MSE: 29733.5707
+FT Epoch 24/30 → MSE: 29757.9242
+FT Epoch 25/30 → MSE: 29276.1334
+FT Epoch 26/30 → MSE: 28659.7596
+FT Epoch 27/30 → MSE: 28128.7635
+FT Epoch 28/30 → MSE: 27984.8371
+FT Epoch 29/30 → MSE: 28577.3287
+FT Epoch 30/30 → MSE: 27325.1694
+✅ Fine‑tuning on max_orig.bench complete; model saved.
+----
+
+
++*In[19]:*+
+[source, ipython3]
+----
+import torch
+from torch_geometric.data import Batch
+
+# 0) (Re‑)load your fine‑tuned weights, if you haven’t already:
+# model.load_state_dict(torch.load("power_predictor_iir_finetuned.pth"))
+# model.to(device)
+
+# 1) Define the recipe you want to predict (20 operation IDs)
+new_recipe = [1, 12, 12, 3, 2, 3, 10, 12, 2, 11, 3, 11, 13, 12, 2, 8, 4, 7, 9, 4]
+
+# 2) Make a batch of size 1 and send to the same device as your model
+recipe_tensor = torch.tensor([new_recipe], dtype=torch.long).to(device)  
+graph_batch   = Batch.from_data_list([graph_max]).to(device)  
+
+# 3) Switch to eval mode and do a forward‑pass
+model.eval()
+with torch.no_grad():
+    pred_power = model({
+        "aig":    graph_batch,
+        "recipe": recipe_tensor
+    }).item()
+
+print(f"Predicted power: {pred_power:.2f}")
+
+----
+
+
++*Out[19]:*+
+----
+Predicted power: 2738.15
+----
+
+
++*In[ ]:*+
+[source, ipython3]
+----
+
+----
